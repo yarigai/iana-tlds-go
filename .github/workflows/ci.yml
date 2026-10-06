@@ -1,0 +1,94 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "0 6 * * *" # Daily, 6am UTC
+
+permissions:
+  contents: read
+
+env:
+  MODULE: github.com/yarigai/iana-tlds-go
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      tld_changed: ${{ steps.tld_check.outputs.changed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go generate ./...
+      - name: Check if TLD list changed
+        id: tld_check
+        run: |
+          if git diff --quiet tlds_data.go; then
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+      # On a scheduled run with no TLD changes there is nothing to test or release.
+      - name: Decide whether to test
+        id: gate
+        run: echo "run=${{ github.event_name != 'schedule' || steps.tld_check.outputs.changed == 'true' }}" >> $GITHUB_OUTPUT
+      - name: Format, vet, test
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+          go vet ./...
+          go test -race -coverprofile=coverage.out ./...
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'schedule' && steps.tld_check.outputs.changed == 'true'
+        with:
+          name: tlds-data
+          path: tlds_data.go
+          retention-days: 1
+
+  release:
+    needs: build
+    if: |
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'schedule' && needs.build.outputs.tld_changed == 'true')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: github.event_name == 'schedule'
+        with:
+          name: tlds-data
+      # Go modules are versioned by git tags: the next patch tag is the release.
+      - name: Commit and tag (schedule only)
+        if: github.event_name == 'schedule'
+        run: |
+          LAST=$(git tag --list 'v*' --sort=-v:refname | head -1)
+          IFS=. read -r MAJOR MINOR PATCH <<< "${LAST#v}"
+          TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
+          git config user.name "Yarigai CI Bot"
+          git config user.email "ci-bot@yarigai.mx"
+          git add tlds_data.go
+          git commit -m "chore(sync): update IANA TLD list → ${TAG} [skip ci]"
+          git tag "$TAG"
+          git push origin HEAD:main
+          git push origin "$TAG"
+          echo "TAG=$TAG" >> $GITHUB_ENV
+      - name: Resolve tag (tag push)
+        if: github.event_name != 'schedule'
+        run: echo "TAG=${{ github.ref_name }}" >> $GITHUB_ENV
+      - name: Create GitHub Release
+        run: gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --generate-notes --title "$TAG"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Warm the Go module proxy and pkg.go.dev so clients can `go get` the tag right away.
+      - name: Publish to Go module proxy
+        run: curl -fsS "https://proxy.golang.org/${MODULE}/@v/${TAG}.info"
